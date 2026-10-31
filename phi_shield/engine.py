@@ -1,20 +1,36 @@
-"""Analyzer engine construction with a documented spaCy fallback chain.
+"""Analyzer engine construction: fail-closed spaCy backend selection.
 
 Preference order for the NLP backend:
 
 1. ``en_core_web_lg``  -- best NER quality for PERSON / LOCATION.
 2. ``en_core_web_sm``  -- small model, still provides NER.
-3. Pattern-only stub   -- a minimal ``NlpEngine`` that returns no NER
-   entities.  The pipeline still runs end-to-end on Presidio's built-in
-   pattern recognizers (dates, phones, emails, SSNs, URLs, IPs) plus the
-   custom recognizers in :mod:`phi_shield.recognizers` (which include
-   title-anchored name patterns, so headers/salutations are still caught).
-   Free-form person/location mentions in body text are the known casualty
-   of this path.
 
-``PHI_SHIELD_SPACY_MODEL`` can pin a specific model name.
+``PHI_SHIELD_SPACY_MODEL`` can name a preferred model; it is tried
+first but never suppresses the preference list -- a bad pin used to
+collapse the candidates to that single name and silently drop an
+installed fallback (security-audit 2026-10-31, finding D1).
+
+Fail-closed policy (finding D1): without a working NER model the
+pipeline cannot see free-form PERSON / LOCATION mentions, so running
+pattern-only would return narrative PHI unredacted under a success
+response.  ``build_analyzer`` therefore raises ``RuntimeError`` when
+no usable model is found.  The pattern-only engine (Presidio built-in
+pattern recognizers plus the custom recognizers in
+:mod:`phi_shield.recognizers`; title-anchored headers still caught,
+free-form body mentions NOT caught) remains available only as an
+explicit operator opt-in via ``PHI_SHIELD_ALLOW_PATTERN_ONLY=1``;
+backends built that way are marked degraded (see
+:func:`backend_is_degraded`) and the API surfaces that marker.
+
+Model supply chain: the models are pinned as exact wheels with
+sha256 hashes in requirements.txt (never ``spacy download``, which
+fetches an unpinned, unhashed current release).  At selection time
+each installed model is additionally checked against the spaCy
+version range its own package metadata declares, so a model built
+for a different spaCy line is rejected instead of loaded.
 """
 
+import importlib.metadata
 import logging
 import os
 import re
@@ -46,6 +62,53 @@ SUPPORTED_ENTITIES = [
 ]
 
 _MODEL_PREFERENCE = ["en_core_web_lg", "en_core_web_sm"]
+
+#: Backend strings for the pattern-only fallback start with this prefix;
+#: it is the single marker the rest of the stack uses to detect the
+#: degraded state.
+DEGRADED_BACKEND_PREFIX = "pattern-only"
+
+_ALLOW_PATTERN_ONLY_ENV = "PHI_SHIELD_ALLOW_PATTERN_ONLY"
+
+
+def backend_is_degraded(backend):
+    """True when *backend* describes the pattern-only fallback."""
+    return bool(backend) and backend.startswith(DEGRADED_BACKEND_PREFIX)
+
+
+def _allow_pattern_only():
+    return os.environ.get(_ALLOW_PATTERN_ONLY_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _model_spacy_compatible(model_name):
+    """True if the installed model package supports the running spaCy.
+
+    The model's own package metadata declares a spaCy version range
+    (e.g. ``spacy <3.8.0,>=3.7.2``); a model installed for a different
+    spaCy line is a mis-pinned deployment and is rejected here rather
+    than loaded.  Models that declare no spaCy constraint are left to
+    the load attempt itself.
+    """
+    from packaging.requirements import Requirement
+
+    try:
+        md = importlib.metadata.metadata(model_name)
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    running = importlib.metadata.version("spacy")
+    for raw in md.get_all("Requires-Dist") or []:
+        try:
+            req = Requirement(raw)
+        except Exception:
+            continue
+        if req.name.lower().replace("_", "-") == "spacy":
+            return running in req.specifier
+    return True
 
 
 class _PatternOnlyArtifacts:
@@ -115,28 +178,65 @@ def _spacy_engine(model_name):
 
 
 def build_analyzer():
-    """Create an AnalyzerEngine; returns (engine, backend_description)."""
-    pinned = os.environ.get("PHI_SHIELD_SPACY_MODEL")
-    candidates = [pinned] if pinned else list(_MODEL_PREFERENCE)
+    """Create an AnalyzerEngine; returns (engine, backend_description).
+
+    Raises RuntimeError when no usable spaCy NER model is available,
+    unless the operator explicitly opted into degraded pattern-only
+    operation with PHI_SHIELD_ALLOW_PATTERN_ONLY=1 (fail-closed,
+    security-audit 2026-10-31 finding D1).
+    """
+    pinned = os.environ.get("PHI_SHIELD_SPACY_MODEL") or None
+    candidates = ([pinned] if pinned else []) + [
+        m for m in _MODEL_PREFERENCE if m != pinned
+    ]
     backend = None
     nlp_engine = None
     import spacy.util
 
     for model in candidates:
-        if not model:
-            continue
         if not spacy.util.is_package(model):
             logger.warning("spaCy model %s not installed; skipping", model)
+            continue
+        if not _model_spacy_compatible(model):
+            logger.warning(
+                "spaCy model %s declares no support for the installed "
+                "spaCy version; skipping",
+                model,
+            )
             continue
         try:
             nlp_engine = _spacy_engine(model)
             backend = f"spacy:{model}"
+            logger.info(
+                "spaCy model %s version %s",
+                model,
+                importlib.metadata.version(model),
+            )
             break
         except Exception as exc:  # model present but failed to load
             logger.warning("spaCy model %s failed to load: %s", model, exc)
     if nlp_engine is None:
-        nlp_engine = _pattern_only_engine()
-        backend = "pattern-only (no spaCy model available)"
+        if _allow_pattern_only():
+            nlp_engine = _pattern_only_engine()
+            backend = (
+                "pattern-only DEGRADED (no spaCy NER model available; "
+                "explicitly enabled via PHI_SHIELD_ALLOW_PATTERN_ONLY)"
+            )
+            logger.error(
+                "PHI-Shield running DEGRADED pattern-only backend: "
+                "free-text PERSON/LOCATION PHI may pass through "
+                "unredacted. Responses are marked degraded."
+            )
+        else:
+            raise RuntimeError(
+                "No usable spaCy NER model available (tried: %s). "
+                "Refusing to run pattern-only: free-text PERSON/LOCATION "
+                "PHI would pass through unredacted under a success "
+                "response. Install a pinned model (requirements.txt) or "
+                "set PHI_SHIELD_ALLOW_PATTERN_ONLY=1 to explicitly "
+                "accept degraded pattern-only operation."
+                % (", ".join(candidates) or "none")
+            )
     analyzer = AnalyzerEngine(nlp_engine=nlp_engine, supported_languages=["en"])
     for recognizer in build_custom_recognizers():
         analyzer.registry.add_recognizer(recognizer)

@@ -29,7 +29,7 @@ import re
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
 
-from .engine import analyze, build_analyzer
+from .engine import analyze, backend_is_degraded, build_analyzer
 
 LABEL_MAP = {
     "PERSON": "PERSON",
@@ -85,6 +85,9 @@ class Deidentifier:
             backend = "external"
         self.analyzer = analyzer
         self.backend = backend
+        #: True only for the explicitly opted-in pattern-only backend;
+        #: callers (app.py) must surface this on every response.
+        self.degraded = backend_is_degraded(backend)
         self._anonymizer = AnonymizerEngine()
 
     def detect(self, text):

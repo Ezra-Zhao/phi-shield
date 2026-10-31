@@ -59,8 +59,10 @@ phi_shield/
                    license, VIN, ZIP, fax, street address, age>89,
                    title-anchored names)
   engine.py        AnalyzerEngine assembly + overlap resolution;
-                   spaCy fallback chain: en_core_web_lg -> en_core_web_sm
-                   -> documented pattern-only engine (spacy.blank)
+                   spaCy chain: en_core_web_lg -> en_core_web_sm;
+                   fail-closed if no usable model (pattern-only only
+                   via explicit PHI_SHIELD_ALLOW_PATTERN_ONLY=1 opt-in,
+                   responses then marked degraded)
   deidentify.py    Deidentifier: mask / label via presidio-anonymizer,
                    safe_harbor via per-instance span transforms
 scripts/
@@ -75,15 +77,26 @@ tests/             pytest suite
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-.venv/bin/python -m spacy download en_core_web_lg   # preferred
-# or: .venv/bin/python -m spacy download en_core_web_sm
+.venv/bin/pip install -r requirements.txt   # includes BOTH spaCy models,
+                                            # pinned wheels + sha256 hashes
 ```
 
-If no spaCy model can be installed, the pipeline still runs end-to-end on
-the pattern-only fallback engine (see `phi_shield/engine.py`); NER-backed
-recall for free-form names/places is then reduced, and the active backend
-is reported by `GET /health` and printed in `eval_report.md`.
+The spaCy models are installed from requirements.txt as exact,
+hash-pinned wheels -- do not substitute `spacy download` (unpinned,
+unhashed). If no usable spaCy model is available at runtime, the
+service **fails closed**: it refuses to start rather than silently
+degrading to the pattern-only engine, which cannot see free-form
+names/places and would return them unredacted under a success
+response. Pattern-only operation remains available only as an
+explicit opt-in (`PHI_SHIELD_ALLOW_PATTERN_ONLY=1`); every response
+is then marked `"degraded": true` with a warning, and `GET /health`
+reports `"status": "degraded"`. The active backend is always
+reported by `GET /health` and printed in `eval_report.md`.
+
+Request bounds: `POST /deidentify` accepts at most 100,000
+characters of text (HTTP 413 beyond that, and for request bodies
+over 1 MiB) and is rate limited per client (HTTP 429; default
+60/minute, `PHI_SHIELD_RATE_LIMIT_PER_MINUTE`).
 
 ## Run
 
@@ -141,8 +154,9 @@ matches and the predicted span covers at least 50% of the gold span
   HIPAA also requires that the covered entity have no actual knowledge
   that residual information can identify an individual; this tool is a
   proof-of-skill demo, not a certified de-identification solution.
-- NER quality depends on the spaCy model in use (`lg` > `sm` >
-  pattern-only). Handwriting, OCR noise, misspellings, and non-English
-  text are out of scope.
+- NER quality depends on the spaCy model in use (`lg` > `sm`). The
+  pattern-only engine exists only as an explicitly opted-in degraded
+  mode (see Setup); it is never entered silently. Handwriting, OCR
+  noise, misspellings, and non-English text are out of scope.
 - Ages are only flagged when over 89 and expressed in the covered surface
   forms (`92-year-old`, `age 92`, `aged 92`, `92 years old`).
